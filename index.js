@@ -151,6 +151,26 @@ async function run() {
       res.json(result);
     })
 
+    // all classes
+    app.get("/api/classes", async (req, res) => {
+  try {
+    const classes = await classCollection
+      .find({})
+      .sort({ _id: -1 })
+      .toArray();
+
+    res.status(200).json(classes);
+  } catch (error) {
+    console.error("Error fetching classes:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to fetch classes", 
+      error: error.message 
+    });
+  }
+});
+
+
 
 
 
