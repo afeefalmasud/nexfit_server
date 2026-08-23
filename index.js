@@ -145,34 +145,111 @@ async function run() {
       }
     });
 
-    app.delete("/api/forum/:id", async(req,res)=>{
-      const {id} = req.params;
-      const result = await forumCollection.deleteOne({_id: new ObjectId(id)});
+    app.delete("/api/forum/:id", async (req, res) => {
+      const { id } = req.params;
+      const result = await forumCollection.deleteOne({ _id: new ObjectId(id) });
       res.json(result);
-    })
+    });
 
     // all classes
+
     app.get("/api/classes", async (req, res) => {
-  try {
-    const classes = await classCollection
-      .find({})
-      .sort({ _id: -1 })
-      .toArray();
+      try {
+        const classes = await classCollection
+          .aggregate([
+            {
+              // Convert string ID to ObjectId for lookup matching
+              $addFields: {
+                trainerObjectId: { $toObjectId: "$trainerId" },
+              },
+            },
+            {
+              $lookup: {
+                from: "user", // Name of your users collection
+                localField: "trainerObjectId",
+                foreignField: "_id",
+                as: "trainerInfo",
+              },
+            },
+            {
+              $unwind: {
+                path: "$trainerInfo",
+                preserveNullAndEmptyArrays: true, // Keep class even if user isn't found
+              },
+            },
+            {
+              $addFields: {
+                trainerName: {
+                  $ifNull: ["$trainerInfo.name", "Master Trainer"],
+                },
+              },
+            },
+            {
+              $project: {
+                trainerInfo: 0, // Exclude heavy user object details like passwords
+                trainerObjectId: 0,
+              },
+            },
+            { $sort: { _id: -1 } },
+          ])
+          .toArray();
 
-    res.status(200).json(classes);
-  } catch (error) {
-    console.error("Error fetching classes:", error);
-    res.status(500).json({ 
-      success: false, 
-      message: "Failed to fetch classes", 
-      error: error.message 
+        res.status(200).json(classes);
+      } catch (error) {
+        console.error("Error fetching classes:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to fetch classes" });
+      }
     });
-  }
-});
+    // all forums
+    app.get("/api/forums", async (req, res) => {
+      try {
+        const posts = await forumCollection
+          .aggregate([
+            {
+              $addFields: {
+                authorObjectId: { $toObjectId: "$trainerId" }, // Change to $authorId if using authorId
+              },
+            },
+            {
+              $lookup: {
+                from: "user",
+                localField: "authorObjectId",
+                foreignField: "_id",
+                as: "authorInfo",
+              },
+            },
+            {
+              $unwind: {
+                path: "$authorInfo",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $addFields: {
+                authorName: { $ifNull: ["$authorInfo.name", "Anonymous"] },
+                role: { $ifNull: ["$authorInfo.role", "Trainer"] },
+              },
+            },
+            {
+              $project: {
+                authorInfo: 0,
+                authorObjectId: 0,
+              },
+            },
+            { $sort: { _id: -1 } },
+          ])
+          .toArray();
 
-
-
-
+        res.status(200).json(posts);
+      } catch (error) {
+        console.error("Error fetching forum posts:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to fetch posts" });
+      }
+    });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
