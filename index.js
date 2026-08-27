@@ -13,7 +13,6 @@ app.get("/", (req, res) => {
 
 const uri = process.env.MONGODB_URI;
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -24,12 +23,13 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // Connect the client to the server	(optional starting in v4.7)
     await client.connect();
     const database = client.db("nexfit");
     const classCollection = database.collection("class");
     const userCollection = database.collection("user");
     const forumCollection = database.collection("forum");
+    const commentsCollection = database.collection("comments");
+    const votesCollection = database.collection("votes");
 
     app.get("/api/user", async (req, res) => {
       try {
@@ -69,7 +69,6 @@ async function run() {
       }
     });
 
-    // class get and post
     app.post("/api/class", async (req, res) => {
       try {
         const classData = req.body;
@@ -108,7 +107,6 @@ async function run() {
       }
     });
 
-    // forum get and post
     app.post("/api/forum", async (req, res) => {
       try {
         const forumData = req.body;
@@ -151,21 +149,18 @@ async function run() {
       res.json(result);
     });
 
-    // all classes
-
     app.get("/api/classes", async (req, res) => {
       try {
         const classes = await classCollection
           .aggregate([
             {
-              // Convert string ID to ObjectId for lookup matching
               $addFields: {
                 trainerObjectId: { $toObjectId: "$trainerId" },
               },
             },
             {
               $lookup: {
-                from: "user", // Name of your users collection
+                from: "user",
                 localField: "trainerObjectId",
                 foreignField: "_id",
                 as: "trainerInfo",
@@ -174,7 +169,7 @@ async function run() {
             {
               $unwind: {
                 path: "$trainerInfo",
-                preserveNullAndEmptyArrays: true, // Keep class even if user isn't found
+                preserveNullAndEmptyArrays: true,
               },
             },
             {
@@ -186,7 +181,7 @@ async function run() {
             },
             {
               $project: {
-                trainerInfo: 0, // Exclude heavy user object details like passwords
+                trainerInfo: 0,
                 trainerObjectId: 0,
               },
             },
@@ -202,14 +197,14 @@ async function run() {
           .json({ success: false, message: "Failed to fetch classes" });
       }
     });
-    // all forums
+
     app.get("/api/forums", async (req, res) => {
       try {
         const posts = await forumCollection
           .aggregate([
             {
               $addFields: {
-                authorObjectId: { $toObjectId: "$trainerId" }, // Change to $authorId if using authorId
+                authorObjectId: { $toObjectId: "$trainerId" },
               },
             },
             {
@@ -251,14 +246,263 @@ async function run() {
       }
     });
 
-    // Send a ping to confirm a successful connection
+    app.get("/api/classes/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ message: "Invalid ID format" });
+        }
+
+        const result = await classCollection
+          .aggregate([
+            { $match: { _id: new ObjectId(id) } },
+            {
+              $addFields: {
+                trainerObjectId: {
+                  $cond: {
+                    if: { $eq: [{ $type: "$trainerId" }, "string"] },
+                    then: { $toObjectId: "$trainerId" },
+                    else: "$trainerId",
+                  },
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "user",
+                localField: "trainerObjectId",
+                foreignField: "_id",
+                as: "trainerInfo",
+              },
+            },
+            {
+              $unwind: {
+                path: "$trainerInfo",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $addFields: {
+                trainerName: {
+                  $ifNull: [
+                    "$trainerInfo.name",
+                    "$trainerInfo.fullName",
+                    "$trainerEmail",
+                    "Master Trainer",
+                  ],
+                },
+              },
+            },
+            {
+              $project: {
+                trainerInfo: 0,
+                trainerObjectId: 0,
+              },
+            },
+          ])
+          .toArray();
+
+        if (!result || result.length === 0) {
+          return res.status(404).json({ message: "Class not found" });
+        }
+
+        res.status(200).json(result[0]);
+      } catch (error) {
+        console.error("Error fetching single class:", error);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
+
+    app.get("/api/forum/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userId } = req.query;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ message: "Invalid ID format" });
+        }
+
+        const postId = new ObjectId(id);
+
+        const postWithAuthor = await forumCollection
+          .aggregate([
+            { $match: { _id: postId } },
+            {
+              $addFields: {
+                authorObjectId: {
+                  $cond: {
+                    if: { $eq: [{ $type: "$trainerId" }, "string"] },
+                    then: { $toObjectId: "$trainerId" },
+                    else: "$trainerId",
+                  },
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "user",
+                localField: "authorObjectId",
+                foreignField: "_id",
+                as: "authorInfo",
+              },
+            },
+            {
+              $unwind: {
+                path: "$authorInfo",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $addFields: {
+                authorName: {
+                  $ifNull: [
+                    "$authorInfo.name",
+                    "$authorInfo.fullName",
+                    "$trainerName",
+                    "Anonymous",
+                  ],
+                },
+              },
+            },
+            {
+              $project: {
+                authorInfo: 0,
+                authorObjectId: 0,
+              },
+            },
+          ])
+          .toArray();
+
+        const post = postWithAuthor[0];
+
+        if (!post) {
+          return res.status(404).json({ message: "Post not found" });
+        }
+
+        const [comments, likeCount, dislikeCount, userVote] = await Promise.all(
+          [
+            commentsCollection
+              .find({ postId: postId })
+              .sort({ createdAt: -1 })
+              .toArray(),
+            votesCollection.countDocuments({ postId: postId, type: "like" }),
+            votesCollection.countDocuments({ postId: postId, type: "dislike" }),
+            userId ? votesCollection.findOne({ postId, userId }) : null,
+          ],
+        );
+
+        res.status(200).json({
+          ...post,
+          comments,
+          likeCount,
+          dislikeCount,
+          userReaction: userVote ? userVote.type : null,
+        });
+      } catch (err) {
+        console.error("Fetch post error:", err);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
+
+    app.post("/api/forum/:id/vote", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { userId, type } = req.body;
+
+        if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+        const postId = new ObjectId(id);
+
+        const existingVote = await votesCollection.findOne({ postId, userId });
+
+        if (existingVote && existingVote.type === type) {
+          await votesCollection.deleteOne({ postId, userId });
+        } else {
+          await votesCollection.updateOne(
+            { postId, userId },
+            { $set: { type, updatedAt: new Date() } },
+            { upsert: true },
+          );
+        }
+
+        res.status(200).json({ message: "Vote updated" });
+      } catch (err) {
+        console.error("Vote error:", err);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
+
+    app.post("/api/forum/:id/comments", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { user, text, parentId } = req.body;
+
+        if (!user?.id) return res.status(401).json({ message: "Unauthorized" });
+        if (!text?.trim()) {
+          return res.status(400).json({ message: "Text required" });
+        }
+
+        const newComment = {
+          postId: new ObjectId(id),
+          parentId: parentId ? new ObjectId(parentId) : null,
+          userId: user.id,
+          userName: user.name || user.email?.split("@")[0] || "User",
+          userEmail: user.email,
+          text,
+          createdAt: new Date(),
+        };
+
+        const result = await commentsCollection.insertOne(newComment);
+        res.status(201).json({ ...newComment, _id: result.insertedId });
+      } catch (err) {
+        console.error("Comment error:", err);
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
+
+    app.patch("/api/forum/:id/comments/:commentId", async (req, res) => {
+      try {
+        const { commentId } = req.params;
+        const { userId, text } = req.body;
+
+        const result = await commentsCollection.updateOne(
+          { _id: new ObjectId(commentId), userId },
+          { $set: { text, updatedAt: new Date() } },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(403).json({ message: "Unauthorized or not found" });
+        }
+
+        res.status(200).json({ message: "Comment updated" });
+      } catch (err) {
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
+
+    app.delete("/api/forum/:id/comments/:commentId", async (req, res) => {
+      try {
+        const { commentId } = req.params;
+        const { userId } = req.query;
+
+        const targetId = new ObjectId(commentId);
+
+        await commentsCollection.deleteMany({
+          $or: [{ _id: targetId, userId }, { parentId: targetId }],
+        });
+
+        res.status(200).json({ message: "Comment deleted" });
+      } catch (err) {
+        res.status(500).json({ message: "Internal server error" });
+      }
+    });
+
     await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!",
     );
   } finally {
-    // Ensures that the client will close when you finish/error
-    // await client.close();
   }
 }
 run().catch(console.dir);
