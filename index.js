@@ -30,6 +30,8 @@ async function run() {
     const forumCollection = database.collection("forum");
     const commentsCollection = database.collection("comments");
     const votesCollection = database.collection("votes");
+    const bookingsCollection = database.collection("bookings");
+    const favoritesCollection = database.collection("favorites");
 
     app.get("/api/user", async (req, res) => {
       try {
@@ -495,6 +497,311 @@ async function run() {
         res.status(200).json({ message: "Comment deleted" });
       } catch (err) {
         res.status(500).json({ message: "Internal server error" });
+      }
+    });
+    // 1. Fetch user bookings or check if booked
+
+    // server.js
+    app.get("/api/bookings/user/:userId", async (req, res) => {
+      try {
+        const { userId } = req.params;
+
+        const userBookings = await bookingsCollection
+          .aggregate([
+            { $match: { userId } },
+            {
+              $addFields: {
+                classObjectId: {
+                  $cond: {
+                    if: {
+                      $regexMatch: {
+                        input: "$classId",
+                        regex: /^[0-9a-fA-F]{24}$/,
+                      },
+                    },
+                    then: { $toObjectId: "$classId" },
+                    else: "$classId",
+                  },
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "class", // Matches database.collection("class") exactly
+                localField: "classObjectId",
+                foreignField: "_id",
+                as: "classDetails",
+              },
+            },
+            {
+              $unwind: {
+                path: "$classDetails",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $project: {
+                _id: 1,
+                userId: 1,
+                classId: 1,
+                price: 1,
+                bookedAt: 1,
+                className: {
+                  $ifNull: [
+                    "$classDetails.className",
+                    "$className",
+                    "$classDetails.name",
+                  ],
+                },
+                trainerName: {
+                  $ifNull: [
+                    "$classDetails.trainerName",
+                    "$classDetails.trainer",
+                    "N/A",
+                  ],
+                },
+                schedule: {
+                  $ifNull: [
+                    "$classDetails.classSchedule",
+                    "$classDetails.schedule",
+                    "N/A",
+                  ],
+                },
+              },
+            },
+          ])
+          .toArray();
+
+        res.json(userBookings);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+      }
+    });
+    app.post("/api/bookings/confirm", async (req, res) => {
+      try {
+        const { userId, classId, className, price } = req.body;
+
+        if (!userId || !classId) {
+          return res
+            .status(400)
+            .json({ success: false, message: "Missing required fields" });
+        }
+
+        const result = await bookingsCollection.updateOne(
+          { userId, classId },
+          {
+            $set: {
+              userId,
+              classId,
+              className,
+              price: parseFloat(price) || 0,
+              bookedAt: new Date(),
+            },
+          },
+          { upsert: true }, // Creates collection & document if it doesn't exist
+        );
+
+        console.log("Booking saved to MongoDB:", result);
+        return res.json({ success: true, result });
+      } catch (err) {
+        console.error("Error saving booking:", err);
+        return res.status(500).json({ success: false, error: err.message });
+      }
+    });
+
+    // Check if user already booked
+    app.get("/api/bookings/check", async (req, res) => {
+      try {
+        const { userId, classId } = req.query;
+        if (!userId || !classId) return res.json({ isBooked: false });
+
+        const booking = await bookingsCollection.findOne({ userId, classId });
+        return res.json({ isBooked: !!booking });
+      } catch (err) {
+        return res.status(500).json({ error: err.message });
+      }
+    });
+    app.post("/api/favorites/toggle", async (req, res) => {
+      try {
+        const { userId, classId, className, price } = req.body;
+        if (!userId || !classId) {
+          return res.status(400).json({ error: "Missing userId or classId" });
+        }
+
+        const existing = await favoritesCollection.findOne({ userId, classId });
+
+        if (existing) {
+          await favoritesCollection.deleteOne({ userId, classId });
+          return res.json({
+            isFavorited: false,
+            message: "Removed from favorites",
+          });
+        } else {
+          await favoritesCollection.insertOne({
+            userId,
+            classId,
+            className,
+            price,
+            addedAt: new Date(),
+          });
+          return res.json({ isFavorited: true, message: "Added to favorites" });
+        }
+      } catch (error) {
+        res.status(500).json({ error: "Failed to toggle favorite" });
+      }
+    });
+
+    // 2. Check Favorite Status for a user & class
+    app.get("/api/favorites/check", async (req, res) => {
+      try {
+        const { userId, classId } = req.query;
+        const existing = await favoritesCollection.findOne({ userId, classId });
+        res.json({ isFavorited: Boolean(existing) });
+      } catch (error) {
+        res.status(500).json({ error: "Failed to check status" });
+      }
+    });
+
+    // 3. Fetch all User Favorites (For your Member Dashboard Page)
+    app.get("/api/favorites/user/:userId", async (req, res) => {
+      try {
+        const { userId } = req.params;
+        const favorites = await favoritesCollection
+          .aggregate([
+            { $match: { userId } },
+            {
+              $addFields: {
+                classObjectId: {
+                  $cond: {
+                    if: {
+                      $regexMatch: {
+                        input: "$classId",
+                        regex: /^[0-9a-fA-F]{24}$/,
+                      },
+                    },
+                    then: { $toObjectId: "$classId" },
+                    else: "$classId",
+                  },
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "class",
+                localField: "classObjectId",
+                foreignField: "_id",
+                as: "classDetails",
+              },
+            },
+            {
+              $unwind: {
+                path: "$classDetails",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $project: {
+                _id: 1,
+                userId: 1,
+                classId: 1,
+                className: {
+                  $ifNull: ["$classDetails.className", "$className"],
+                },
+                schedule: { $ifNull: ["$classDetails.classSchedule", "N/A"] },
+                price: { $ifNull: ["$classDetails.price", "$price"] },
+                coverImage: {
+                  $ifNull: [
+                    "$classDetails.coverImage",
+                    "$coverImage",
+                    "/images/cardio.jpg",
+                  ],
+                },
+              },
+            },
+          ])
+          .toArray();
+
+        res.json(favorites);
+      } catch (error) {
+        res.status(500).json({ error: "Failed to fetch user favorites" });
+      }
+    });
+
+    // Admin Overview Stats Endpoint
+    app.get("/api/admin/overview-stats", async (req, res) => {
+      try {
+        const totalUsers = await userCollection.countDocuments();
+        const totalClasses = await classCollection.countDocuments();
+        const bookedClasses = await bookingsCollection.countDocuments();
+        const pendingClasses = await classCollection.countDocuments({
+          status: "pending",
+        });
+
+        res.json({
+          totalUsers,
+          totalClasses,
+          bookedClasses,
+          usersSubtext: "+412 this month",
+          classesSubtext: `${pendingClasses} pending review`,
+          bookedSubtext: "+18% MoM",
+        });
+      } catch (error) {
+        res.status(500).json({ error: "Failed to fetch overview stats" });
+      }
+    });
+
+    // Admin Recent Transactions Endpoint
+    app.get("/api/admin/recent-transactions", async (req, res) => {
+      try {
+        const transactions = await bookingsCollection
+          .find({})
+          .sort({ bookedAt: -1 })
+          .limit(5)
+          .toArray();
+
+        res.json(transactions);
+      } catch (error) {
+        res.status(500).json({ error: "Failed to fetch recent transactions" });
+      }
+    });
+
+    // Get all users
+    app.get("/api/admin/users", async (req, res) => {
+      try {
+        const users = await userCollection.find({}).toArray();
+        res.json(users);
+      } catch (err) {
+        res.status(500).json({ error: "Failed to fetch users" });
+      }
+    });
+
+    // Update User Status (Block / Unblock)
+    app.patch("/api/admin/users/:id/status", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+        await userCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status } },
+        );
+        res.json({ message: "User status updated successfully" });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to update user status" });
+      }
+    });
+
+    app.get("/api/users/me", async (req, res) => {
+      try {
+        const { email } = req.query;
+        if (!email) return res.status(400).json({ error: "Email required" });
+
+        const user = await userCollection.findOne({ email });
+        if (!user) return res.status(404).json({ error: "User not found" });
+
+        res.json(user);
+      } catch (err) {
+        res.status(500).json({ error: "Server error" });
       }
     });
 
