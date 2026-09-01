@@ -209,6 +209,11 @@ async function run() {
       try {
         const posts = await forumCollection
           .aggregate([
+             {
+              $match: {
+                status: "approved"
+              }
+            },
             {
               $addFields: {
                 authorObjectId: { $toObjectId: "$trainerId" },
@@ -989,6 +994,80 @@ app.delete('/api/admin/classes/:id/reject', async (req, res) => {
   }
 });
 
+// 1. Get all forum posts for Admin (Includes user lookup)
+app.get("/api/admin/posts", async (req, res) => {
+  try {
+    const posts = await forumCollection
+      .aggregate([
+        {
+          $addFields: {
+            trainerObjectId: { $toObjectId: '$trainerId' },
+          },
+        },
+        {
+          $lookup: {
+            from: 'user',
+            localField: 'trainerObjectId',
+            foreignField: '_id',
+            as: 'trainerInfo',
+          },
+        },
+        {
+          $unwind: {
+            path: '$trainerInfo',
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $addFields: {
+            trainerName: {
+              $ifNull: ['$trainerInfo.name', 'Master Trainer'],
+            },
+            trainerEmail: {
+              $ifNull: ['$trainerInfo.email', 'N/A'],
+            },
+          },
+        },
+        {
+          $project: {
+            trainerInfo: 0,
+            trainerObjectId: 0,
+          },
+        },
+        { $sort: { _id: -1 } },
+      ])
+      .toArray();
+
+    res.status(200).json(posts);
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to fetch posts" });
+  }
+});
+
+// 2. Admin Approve Endpoint (Updates status to 'approved')
+app.patch("/api/admin/posts/:id/approve", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await forumCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: "approved" } }
+    );
+    res.json({ success: true, message: "Post approved successfully" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 3. Admin Reject Endpoint (Deletes the post document)
+app.delete("/api/admin/posts/:id/reject", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await forumCollection.deleteOne({ _id: new ObjectId(id) });
+    res.json({ success: true, message: "Post rejected and removed" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 
 
