@@ -111,11 +111,11 @@ async function run() {
 
     app.post("/api/forum", async (req, res) => {
       try {
-        const forumData = req.body;
+        const { userRole, ...forumData } = req.body;        
         const newForum = {
           ...forumData,
           trainerId: forumData.trainerId,
-          status: 'pending',
+          status: userRole === 'admin' ? 'approved' : 'pending',
           createdAt: new Date(),
         };
         const result = await forumCollection.insertOne(newForum);
@@ -744,6 +744,7 @@ async function run() {
         const totalUsers = await userCollection.countDocuments();
         const totalClasses = await classCollection.countDocuments();
         const bookedClasses = await bookingsCollection.countDocuments();
+        const totalForum = await forumCollection.countDocuments();
         const pendingClasses = await classCollection.countDocuments({
           status: "pending",
         });
@@ -752,6 +753,7 @@ async function run() {
           totalUsers,
           totalClasses,
           bookedClasses,
+          totalForum,
           usersSubtext: "+412 this month",
           classesSubtext: `${pendingClasses} pending review`,
           bookedSubtext: "+18% MoM",
@@ -1068,7 +1070,50 @@ app.delete("/api/admin/posts/:id/reject", async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
+app.get('/api/admin/transactions', async (req, res) => {
+  try {
+    const transactions = await bookingsCollection
+          .aggregate([
+        { $sort: { bookedAt: 1 } },
+        { $limit: 5 },
+        {
+          $addFields: {
+            userObjectId: { $toObjectId: "$userId" } 
+          }
+        },
+        {
+          $lookup: {
+            from: "user", // Name of your users collection in MongoDB
+            localField: "userObjectId",
+            foreignField: "_id",
+            as: "userInfo"
+          }
+        },
+        {
+          $unwind: {
+            path: "$userInfo",
+            preserveNullAndEmptyArrays: true
+          }
+        },
+        {
+          $project: {
+            _id: 1,
+            price: 1,
+            amount: 1,
+            bookedAt: 1,
+            createdAt: 1,
+            // Extract email from joined user document, or fall back to embedded object
+            email: { $ifNull: ["$userInfo.email", "$user.email", "N/A"] }
+          }
+        }
+      ])
+      .toArray();
 
+    res.json(transactions);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
 
 
 
