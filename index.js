@@ -32,6 +32,7 @@ async function run() {
     const votesCollection = database.collection("votes");
     const bookingsCollection = database.collection("bookings");
     const favoritesCollection = database.collection("favorites");
+    const trainerApplicationsCollection= database.collection("application");
 
     app.get("/api/user", async (req, res) => {
       try {
@@ -1116,7 +1117,220 @@ app.get('/api/admin/transactions', async (req, res) => {
 });
 
 
+// POST: Submit a new trainer application
+app.post('/api/trainer-applications', async (req, res) => {
+  try {
+    const { userId, email, fullName, experience, specialty, availableTimes, coachingPhilosophy } = req.body;
 
+    // Check if user already has a pending application
+    const existingApp = await trainerApplicationsCollection.findOne({
+      $or: [{ userId }, { email }],
+      status: 'pending',
+    });
+
+    if (existingApp) {
+      return res.status(400).json({
+        success: false,
+        message: 'You already have a pending trainer application under review.',
+      });
+    }
+
+    const newApplication = {
+      userId,
+      fullName,
+      email,
+      experience: Number(experience),
+      specialty,
+      availableTimes,
+      coachingPhilosophy,
+      status: 'pending',
+      appliedAt: new Date(),
+    };
+
+    const result = await trainerApplicationsCollection.insertOne(newApplication);
+    res.status(201).json({ success: true, insertedId: result.insertedId });
+  } catch (error) {
+    console.error('Error submitting trainer application:', error);
+    res.status(500).json({ success: false, message: 'Failed to process application' });
+  }
+});
+
+// 1. GET: Fetch all trainer applications with user data joined
+app.get('/api/admin/applied-trainers', async (req, res) => {
+  try {
+    const applications = await trainerApplicationsCollection
+      .aggregate([
+        {
+          $addFields: {
+            userObjectId: {
+              $convert: {
+                input: '$userId',
+                to: 'objectId',
+                onError: '$userId',
+                onNull: '$userId',
+              },
+            },
+          },
+        },
+        {
+          $lookup: {
+            from: 'users', // Check your MongoDB collection name ('users' or 'user')
+            localField: 'userObjectId',
+            foreignField: '_id',
+            as: 'userInfo',
+          },
+        },
+        {
+          $unwind: {
+            path: '$userInfo',
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $addFields: {
+            userName: { $ifNull: ['$userInfo.name', '$fullName', '$email'] },
+            userEmail: { $ifNull: ['$userInfo.email', '$email'] },
+          },
+        },
+        {
+          $project: { userInfo: 0, userObjectId: 0 },
+        },
+        {
+          $sort: { appliedAt: -1 },
+        },
+      ])
+      .toArray();
+
+    res.json(applications);
+  } catch (error) {
+    console.error('Error fetching applications:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// 2. PATCH: Update Status (Approve/Reject) + Reason + Role Promotion
+app.patch('/api/admin/applied-trainers/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, rejectionReason } = req.body;
+
+    // Build base update payload
+    const updateDoc = {
+      $set: {
+        status,
+        reviewedAt: new Date(),
+      },
+    };
+
+    if (status === 'rejected' && rejectionReason) {
+      updateDoc.$set.rejectionReason = rejectionReason;
+    } else if (status === 'approved') {
+      updateDoc.$unset = { rejectionReason: '' };
+    }
+
+    // 1. Fetch current application
+    const application = await trainerApplicationsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!application) {
+      return res.status(404).json({ success: false, message: 'Application not found' });
+    }
+
+    // 2. Update application document
+    await trainerApplicationsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc
+    );
+
+    // 3. If approved, promote user role in `users` collection
+    if (status === 'approved') {
+      const userFilter = ObjectId.isValid(application.userId)
+        ? { _id: new ObjectId(application.userId) }
+        : { _id: application.userId };
+
+      await userCollection.updateOne(userFilter, {
+        $set: {
+          role: 'trainer',
+          specialty: application.specialty,
+          experience: application.experience,
+        },
+      });
+    }
+
+    res.json({ success: true, message: `Application mark as ${status}` });
+  } catch (error) {
+    console.error('Error updating status:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+const buildUserQuery = (userId, email) => {
+  const conditions = [];
+  if (userId) {
+    conditions.push({ userId: userId });
+    if (ObjectId.isValid(userId)) {
+      conditions.push({ userId: new ObjectId(userId) });
+    }
+  }
+  if (email) conditions.push({ email: email });
+  return conditions.length > 0 ? { $or: conditions } : {};
+};
+
+// GET: Dashboard Stats & Trainer Application Status for Member
+app.get('/api/member/stats', async (req, res) => {
+  try {
+    const { userId, email } = req.query;
+
+    const userQuery = buildUserQuery(userId, email);
+
+    // 1. Fetch latest application
+    const application = await trainerApplicationsCollection
+      .find(userQuery)
+      .sort({ appliedAt: -1 })
+      .limit(1)
+      .toArray();
+
+    // 2. Count Booked Classes & Favorites
+    const bookedCount = await bookingsCollection.countDocuments(userQuery);
+    const favoritesCount = await favoritesCollection.countDocuments(userQuery);
+
+    res.json({
+      success: true,
+      bookedCount,
+      favoritesCount,
+      application: application[0] || null,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET: Booked Classes for Member
+app.get('/api/member/booked-classes', async (req, res) => {
+  try {
+    const { userId, email } = req.query;
+    const userQuery = buildUserQuery(userId, email);
+
+    const bookings = await bookingsCollection.find(userQuery).sort({ bookedAt: -1 }).toArray();
+    res.json(bookings);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET: Favorite Classes for Member
+app.get('/api/member/favorite-classes', async (req, res) => {
+  try {
+    const { userId, email } = req.query;
+    const userQuery = buildUserQuery(userId, email);
+
+    const favorites = await favoritesCollection.find(userQuery).sort({ savedAt: -1 }).toArray();
+    res.json(favorites);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 
 
