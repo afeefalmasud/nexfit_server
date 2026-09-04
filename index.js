@@ -6,7 +6,7 @@ require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const allowedOrigins = [
   "http://localhost:3000",
-  "https://your-production-domain.com",
+  "https://nexfit-ten.vercel.app",
 ];
 
 app.use(
@@ -39,7 +39,7 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    await client.connect();
+    // await client.connect();
     const database = client.db("nexfit");
     const classCollection = database.collection("class");
     const userCollection = database.collection("user");
