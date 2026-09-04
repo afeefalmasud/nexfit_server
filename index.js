@@ -4,7 +4,23 @@ const app = express();
 const port = 5000;
 require("dotenv").config();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-app.use(cors());
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://your-production-domain.com",
+];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 app.get("/", (req, res) => {
@@ -32,7 +48,98 @@ async function run() {
     const votesCollection = database.collection("votes");
     const bookingsCollection = database.collection("bookings");
     const favoritesCollection = database.collection("favorites");
-    const trainerApplicationsCollection= database.collection("application");
+    const trainerApplicationsCollection = database.collection("application");
+    const verifyToken = async (req, res, next) => {
+      try {
+        let token = null;
+
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith("Bearer ")) {
+          token = authHeader.split(" ")[1];
+        }
+
+        if (!token && req.headers.cookie) {
+          const match = req.headers.cookie.match(
+            /better-auth\.session_token=([^;]+)/,
+          );
+          if (match) {
+            token = decodeURIComponent(match[1]).split(".")[0];
+          }
+        }
+
+        if (!token || token === "undefined") {
+          return res.status(401).json({
+            success: false,
+            message: "Access denied. No valid token provided.",
+          });
+        }
+
+        const session = await database.collection("session").findOne({
+          $or: [{ token }, { sessionToken: token }],
+        });
+
+        if (!session) {
+          return res
+            .status(401)
+            .json({ success: false, message: "Invalid session token." });
+        }
+
+        if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+          return res
+            .status(401)
+            .json({ success: false, message: "Session expired." });
+        }
+
+        const user = await database.collection("user").findOne({
+          _id: ObjectId.isValid(session.userId)
+            ? new ObjectId(session.userId)
+            : session.userId,
+        });
+
+        if (!user) {
+          return res
+            .status(401)
+            .json({ success: false, message: "User account not found." });
+        }
+
+        if (user.status && user.status.toLowerCase() === "blocked") {
+          return res
+            .status(403)
+            .json({ success: false, message: "Account is blocked." });
+        }
+
+        req.user = user;
+        req.session = session;
+        next();
+      } catch (error) {
+        console.error("Auth Middleware Error:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Authentication failure." });
+      }
+    };
+
+    const requireRole = (...allowedRoles) => {
+      return (req, res, next) => {
+        if (!req.user) {
+          return res
+            .status(401)
+            .json({ success: false, message: "Unauthorized." });
+        }
+
+        const userRole = (req.user.role || "member").toLowerCase();
+        const normalizedAllowedRoles = allowedRoles.map((r) => r.toLowerCase());
+
+        if (!normalizedAllowedRoles.includes(userRole)) {
+          return res.status(403).json({
+            success: false,
+            message: `Forbidden: Requires one of [${allowedRoles.join(", ")}] roles.`,
+          });
+        }
+
+        next();
+      };
+    };
 
     app.get("/api/user", async (req, res) => {
       try {
@@ -72,6 +179,27 @@ async function run() {
       }
     });
 
+    app.get("/api/stats", async (req, res) => {
+      try {
+        const activeMembers = await userCollection.countDocuments({
+          role: "member",
+        });
+        const certifiedTrainers = await userCollection.countDocuments({
+          role: "trainer",
+        });
+
+        const weeklyClasses = await classCollection.countDocuments();
+
+        res.status(200).json({
+          membersCount: activeMembers,
+          classesCount: weeklyClasses,
+          trainersCount: certifiedTrainers,
+        });
+      } catch (error) {
+        console.error("Error fetching stats:", error);
+        res.status(500).json({ message: "Failed to fetch stats data" });
+      }
+    });
     app.post("/api/class", async (req, res) => {
       try {
         const classData = req.body;
@@ -79,7 +207,7 @@ async function run() {
         const newClass = {
           ...classData,
           trainerId: classData.trainerId,
-          status: 'pending',
+          status: "pending",
           createdAt: new Date(),
         };
 
@@ -112,11 +240,11 @@ async function run() {
 
     app.post("/api/forum", async (req, res) => {
       try {
-        const { userRole, ...forumData } = req.body;        
+        const { userRole, ...forumData } = req.body;
         const newForum = {
           ...forumData,
           trainerId: forumData.trainerId,
-          status: userRole === 'admin' ? 'approved' : 'pending',
+          status: userRole === "admin" ? "approved" : "pending",
           createdAt: new Date(),
         };
         const result = await forumCollection.insertOne(newForum);
@@ -158,12 +286,20 @@ async function run() {
           .aggregate([
             {
               $match: {
-                status: "approved"
-              }
+                status: "approved",
+              },
             },
             {
               $addFields: {
-                trainerObjectId: { $toObjectId: "$trainerId" },
+                classIdStr: { $toString: "$_id" },
+                trainerObjectId: {
+                  $convert: {
+                    input: "$trainerId",
+                    to: "objectId",
+                    onError: null,
+                    onNull: null,
+                  },
+                },
               },
             },
             {
@@ -181,16 +317,40 @@ async function run() {
               },
             },
             {
+              $lookup: {
+                from: "bookings",
+                let: { cIdStr: "$classIdStr", cIdObj: "$_id" },
+                pipeline: [
+                  {
+                    $match: {
+                      $expr: {
+                        $or: [
+                          { $eq: ["$classId", "$$cIdStr"] },
+                          { $eq: ["$classId", "$$cIdObj"] },
+                        ],
+                      },
+                    },
+                  },
+                ],
+                as: "itemBook",
+              },
+            },
+
+            {
               $addFields: {
                 trainerName: {
                   $ifNull: ["$trainerInfo.name", "Master Trainer"],
                 },
+                bookedCount: { $size: "$itemBook" },
               },
             },
+
             {
               $project: {
                 trainerInfo: 0,
                 trainerObjectId: 0,
+                classIdStr: 0,
+                itemBook: 0,
               },
             },
             { $sort: { _id: -1 } },
@@ -205,15 +365,102 @@ async function run() {
           .json({ success: false, message: "Failed to fetch classes" });
       }
     });
+    app.get("/api/classes/featured", async (req, res) => {
+      try {
+        const featuredClasses = await classCollection
+          .aggregate([
+            {
+              $addFields: {
+                classIdStr: { $toString: "$_id" },
+                trainerObjectId: {
+                  $cond: {
+                    if: {
+                      $and: [
+                        { $ne: ["$trainerId", null] },
+                        { $ne: ["$trainerId", ""] },
+                        { $eq: [{ $type: "$trainerId" }, "string"] },
+                      ],
+                    },
+                    then: { $toObjectId: "$trainerId" },
+                    else: "$trainerId",
+                  },
+                },
+              },
+            },
+            {
+              $lookup: {
+                from: "user",
+                localField: "trainerObjectId",
+                foreignField: "_id",
+                as: "trainerInfo",
+              },
+            },
+            {
+              $unwind: {
+                path: "$trainerInfo",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $lookup: {
+                from: "bookings",
+                let: { cIdStr: "$classIdStr", cIdObj: "$_id" },
+                pipeline: [
+                  {
+                    $match: {
+                      $expr: {
+                        $or: [
+                          { $eq: ["$classId", "$$cIdStr"] },
+                          { $eq: ["$classId", "$$cIdObj"] },
+                        ],
+                      },
+                    },
+                  },
+                ],
+                as: "itemBook",
+              },
+            },
+            {
+              $addFields: {
+                trainerName: {
+                  $ifNull: [
+                    "$trainerInfo.name",
+                    "$trainerInfo.fullName",
+                    "$trainerEmail",
+                    "Master Trainer",
+                  ],
+                },
+                bookedCount: { $size: { $ifNull: ["$itemBook", []] } },
+              },
+            },
+            { $sort: { bookedCount: -1 } },
+            { $limit: 4 },
+            {
+              $project: {
+                trainerInfo: 0,
+                trainerObjectId: 0,
+                classIdStr: 0,
+                itemBook: 0,
+              },
+            },
+          ])
+          .toArray();
+
+        res.status(200).json(featuredClasses);
+      } catch (error) {
+        console.error("Featured Classes Aggregation Error:", error);
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
 
     app.get("/api/forums", async (req, res) => {
       try {
         const posts = await forumCollection
           .aggregate([
-             {
+            {
               $match: {
-                status: "approved"
-              }
+                status: "approved",
+              },
             },
             {
               $addFields: {
@@ -258,7 +505,58 @@ async function run() {
           .json({ success: false, message: "Failed to fetch posts" });
       }
     });
+    app.get("/api/forum/latest", async (req, res) => {
+      try {
+        const posts = await forumCollection
+          .aggregate([
+            {
+              $match: {
+                status: "approved",
+              },
+            },
+            {
+              $addFields: {
+                authorObjectId: { $toObjectId: "$trainerId" },
+              },
+            },
+            {
+              $lookup: {
+                from: "user",
+                localField: "authorObjectId",
+                foreignField: "_id",
+                as: "authorInfo",
+              },
+            },
+            {
+              $unwind: {
+                path: "$authorInfo",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $addFields: {
+                authorName: { $ifNull: ["$authorInfo.name", "Anonymous"] },
+                role: { $ifNull: ["$authorInfo.role", "Trainer"] },
+              },
+            },
+            {
+              $project: {
+                authorInfo: 0,
+                authorObjectId: 0,
+              },
+            },
+            { $sort: { _id: -1 } },
+          ])
+          .toArray();
 
+        res.status(200).json(posts);
+      } catch (error) {
+        console.error("Error fetching latest forum posts:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to fetch forum posts" });
+      }
+    });
     app.get("/api/classes/:id", async (req, res) => {
       try {
         const { id } = req.params;
@@ -272,6 +570,7 @@ async function run() {
             { $match: { _id: new ObjectId(id) } },
             {
               $addFields: {
+                classIdStr: { $toString: "$_id" },
                 trainerObjectId: {
                   $cond: {
                     if: { $eq: [{ $type: "$trainerId" }, "string"] },
@@ -281,6 +580,7 @@ async function run() {
                 },
               },
             },
+
             {
               $lookup: {
                 from: "user",
@@ -295,6 +595,27 @@ async function run() {
                 preserveNullAndEmptyArrays: true,
               },
             },
+
+            {
+              $lookup: {
+                from: "bookings",
+                let: { cIdStr: "$classIdStr", cIdObj: "$_id" },
+                pipeline: [
+                  {
+                    $match: {
+                      $expr: {
+                        $or: [
+                          { $eq: ["$classId", "$$cIdStr"] },
+                          { $eq: ["$classId", "$$cIdObj"] },
+                        ],
+                      },
+                    },
+                  },
+                ],
+                as: "itemBook",
+              },
+            },
+
             {
               $addFields: {
                 trainerName: {
@@ -305,12 +626,14 @@ async function run() {
                     "Master Trainer",
                   ],
                 },
+                bookedCount: { $size: "$itemBook" },
               },
             },
             {
               $project: {
                 trainerInfo: 0,
                 trainerObjectId: 0,
+                classIdStr: 0,
               },
             },
           ])
@@ -326,7 +649,6 @@ async function run() {
         res.status(500).json({ message: "Internal server error" });
       }
     });
-
     app.get("/api/forum/:id", async (req, res) => {
       try {
         const { id } = req.params;
@@ -510,9 +832,7 @@ async function run() {
         res.status(500).json({ message: "Internal server error" });
       }
     });
-    // 1. Fetch user bookings or check if booked
 
-    // server.js
     app.get("/api/bookings/user/:userId", async (req, res) => {
       try {
         const { userId } = req.params;
@@ -538,7 +858,7 @@ async function run() {
             },
             {
               $lookup: {
-                from: "class", // Matches database.collection("class") exactly
+                from: "class",
                 localField: "classObjectId",
                 foreignField: "_id",
                 as: "classDetails",
@@ -610,7 +930,7 @@ async function run() {
               bookedAt: new Date(),
             },
           },
-          { upsert: true }, // Creates collection & document if it doesn't exist
+          { upsert: true },
         );
 
         console.log("Booking saved to MongoDB:", result);
@@ -621,7 +941,6 @@ async function run() {
       }
     });
 
-    // Check if user already booked
     app.get("/api/bookings/check", async (req, res) => {
       try {
         const { userId, classId } = req.query;
@@ -674,7 +993,6 @@ async function run() {
       }
     });
 
-    // 3. Fetch all User Favorites (For your Member Dashboard Page)
     app.get("/api/favorites/user/:userId", async (req, res) => {
       try {
         const { userId } = req.params;
@@ -739,90 +1057,103 @@ async function run() {
       }
     });
 
-    // Admin Overview Stats Endpoint
-    app.get("/api/admin/overview-stats", async (req, res) => {
-      try {
-        const totalUsers = await userCollection.countDocuments();
-        const totalClasses = await classCollection.countDocuments();
-        const bookedClasses = await bookingsCollection.countDocuments();
-        const totalForum = await forumCollection.countDocuments();
-        const pendingClasses = await classCollection.countDocuments({
-          status: "pending",
-        });
+    app.get(
+      "/api/admin/overview-stats",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const totalUsers = await userCollection.countDocuments();
+          const totalClasses = await classCollection.countDocuments();
+          const bookedClasses = await bookingsCollection.countDocuments();
+          const totalForum = await forumCollection.countDocuments();
+          const pendingClasses = await classCollection.countDocuments({
+            status: "pending",
+          });
 
-        res.json({
-          totalUsers,
-          totalClasses,
-          bookedClasses,
-          totalForum,
-          usersSubtext: "+412 this month",
-          classesSubtext: `${pendingClasses} pending review`,
-          bookedSubtext: "+18% MoM",
-        });
-      } catch (error) {
-        res.status(500).json({ error: "Failed to fetch overview stats" });
-      }
-    });
-
-    // Admin Recent Transactions Endpoint
-    app.get("/api/admin/recent-transactions", async (req, res) => {
-  try {
-    const transactions = await bookingsCollection
-      .aggregate([
-        { $sort: { bookedAt: -1 } },
-        { $limit: 5 },
-        // Convert string userId to ObjectId if needed before join
-        {
-          $addFields: {
-            userObjectId: { $toObjectId: "$userId" } 
-          }
-        },
-        {
-          $lookup: {
-            from: "user", // Name of your users collection in MongoDB
-            localField: "userObjectId",
-            foreignField: "_id",
-            as: "userInfo"
-          }
-        },
-        {
-          $unwind: {
-            path: "$userInfo",
-            preserveNullAndEmptyArrays: true
-          }
-        },
-        {
-          $project: {
-            _id: 1,
-            price: 1,
-            amount: 1,
-            bookedAt: 1,
-            createdAt: 1,
-            // Extract email from joined user document, or fall back to embedded object
-            email: { $ifNull: ["$userInfo.email", "$user.email", "N/A"] }
-          }
+          res.json({
+            totalUsers,
+            totalClasses,
+            bookedClasses,
+            totalForum,
+            usersSubtext: "+412 this month",
+            classesSubtext: `${pendingClasses} pending review`,
+            bookedSubtext: "+18% MoM",
+          });
+        } catch (error) {
+          res.status(500).json({ error: "Failed to fetch overview stats" });
         }
-      ])
-      .toArray();
+      },
+    );
 
-    res.json(transactions);
-  } catch (error) {
-    console.error("Error fetching transactions:", error);
-    res.status(500).json({ error: "Failed to fetch recent transactions" });
-  }
-});
+    app.get(
+      "/api/admin/recent-transactions",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const transactions = await bookingsCollection
+            .aggregate([
+              { $sort: { bookedAt: -1 } },
+              { $limit: 5 },
 
-    // Get all users
-    app.get("/api/admin/users", async (req, res) => {
-      try {
-        const users = await userCollection.find({}).toArray();
-        res.json(users);
-      } catch (err) {
-        res.status(500).json({ error: "Failed to fetch users" });
-      }
-    });
+              {
+                $addFields: {
+                  userObjectId: { $toObjectId: "$userId" },
+                },
+              },
+              {
+                $lookup: {
+                  from: "user",
+                  localField: "userObjectId",
+                  foreignField: "_id",
+                  as: "userInfo",
+                },
+              },
+              {
+                $unwind: {
+                  path: "$userInfo",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  price: 1,
+                  amount: 1,
+                  bookedAt: 1,
+                  createdAt: 1,
 
-    // Update User Status (Block / Unblock)
+                  email: { $ifNull: ["$userInfo.email", "$user.email", "N/A"] },
+                },
+              },
+            ])
+            .toArray();
+
+          res.json(transactions);
+        } catch (error) {
+          console.error("Error fetching transactions:", error);
+          res
+            .status(500)
+            .json({ error: "Failed to fetch recent transactions" });
+        }
+      },
+    );
+
+    app.get(
+      "/api/admin/users",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const users = await userCollection.find({}).toArray();
+          res.json(users);
+        } catch (err) {
+          res.status(500).json({ error: "Failed to fetch users" });
+        }
+      },
+    );
+
     app.patch("/api/admin/users/:id/status", async (req, res) => {
       try {
         const { id } = req.params;
@@ -850,495 +1181,563 @@ async function run() {
         res.status(500).json({ error: "Server error" });
       }
     });
-// 1. Get Trainers Query
-app.get('/api/admin/trainers', async (req, res) => {
-  try {
-    const trainers = await userCollection
-      .aggregate([
-        { $match: { role: { $in: ['trainer', 'member'] } } },
-        {
-          $lookup: {
-            from: 'class',
-            localField: 'email',
-            foreignField: 'trainerEmail',
-            as: 'trainerClasses'
-          }
-        },
-        {
-          $addFields: {
-            classIdsAsStrings: {
-              $map: {
-                input: '$trainerClasses',
-                as: 'c',
-                in: { $toString: '$$c._id' }
-              }
-            }
-          }
-        },
-        {
-          $lookup: {
-            from: 'bookings',
-            localField: 'classIdsAsStrings',
-            foreignField: 'classId',
-            as: 'classBookings'
-          }
-        },
-        {
-          $project: {
-            _id: 1,
-            name: 1,
-            email: 1,
-            image: 1,
-            role: 1, // <--- MUST RETURN ROLE HERE
-            classesCount: { $size: '$trainerClasses' },
-            studentsCount: { $size: '$classBookings' }
-          }
-        }
-      ])
-      .toArray();
-
-    res.json(trainers);
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch trainers' });
-  }
-});
-
-// 2. Role Toggle Route
-app.patch('/api/admin/trainers/:id/role', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { role } = req.body;
-
-    await userCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { role: role } }
-    );
-
-    res.json({ message: `Role updated to ${role}` });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update role' });
-  }
-});
-
-
-// Get all classes for Admin Dashboard
-app.get('/api/admin/classes', async (req, res) => {
-  try {
-    const classes = await classCollection
-      .aggregate([
-        {
-          $addFields: {
-            trainerObjectId: { $toObjectId: '$trainerId' },
-          },
-        },
-        {
-          $lookup: {
-            from: 'user',
-            localField: 'trainerObjectId',
-            foreignField: '_id',
-            as: 'trainerInfo',
-          },
-        },
-        {
-          $unwind: {
-            path: '$trainerInfo',
-            preserveNullAndEmptyArrays: true,
-          },
-        },
-        {
-          $addFields: {
-            trainerName: {
-              $ifNull: ['$trainerInfo.name', 'Master Trainer'],
-            },
-            trainerEmail: {
-              $ifNull: ['$trainerInfo.email', 'N/A'],
-            },
-          },
-        },
-        {
-          $project: {
-            trainerInfo: 0,
-            trainerObjectId: 0,
-          },
-        },
-        { $sort: { _id: -1 } },
-      ])
-      .toArray();
-
-    res.status(200).json(classes);
-  } catch (err) {
-    console.error('Error fetching admin classes:', err);
-    res.status(500).json({ error: 'Failed to fetch classes for admin' });
-  }
-});
-
-// Admin Approve Action
-app.patch('/api/admin/classes/:id/approve', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await classCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status: 'approved' } }
-    );
-    res.json({ success: true, message: 'Class approved successfully' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to approve class' });
-  }
-});
-
-// Admin Reject Action (Deletes the class)
-app.delete('/api/admin/classes/:id/reject', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await classCollection.deleteOne({ _id: new ObjectId(id) });
-    res.json({ success: true, message: 'Class rejected and deleted' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to reject class' });
-  }
-});
-
-// 1. Get all forum posts for Admin (Includes user lookup)
-app.get("/api/admin/posts", async (req, res) => {
-  try {
-    const posts = await forumCollection
-      .aggregate([
-        {
-          $addFields: {
-            trainerObjectId: { $toObjectId: '$trainerId' },
-          },
-        },
-        {
-          $lookup: {
-            from: 'user',
-            localField: 'trainerObjectId',
-            foreignField: '_id',
-            as: 'trainerInfo',
-          },
-        },
-        {
-          $unwind: {
-            path: '$trainerInfo',
-            preserveNullAndEmptyArrays: true,
-          },
-        },
-        {
-          $addFields: {
-            trainerName: {
-              $ifNull: ['$trainerInfo.name', 'Master Trainer'],
-            },
-            trainerEmail: {
-              $ifNull: ['$trainerInfo.email', 'N/A'],
-            },
-          },
-        },
-        {
-          $project: {
-            trainerInfo: 0,
-            trainerObjectId: 0,
-          },
-        },
-        { $sort: { _id: -1 } },
-      ])
-      .toArray();
-
-    res.status(200).json(posts);
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Failed to fetch posts" });
-  }
-});
-
-// 2. Admin Approve Endpoint (Updates status to 'approved')
-app.patch("/api/admin/posts/:id/approve", async (req, res) => {
-  try {
-    const { id } = req.params;
-    await forumCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status: "approved" } }
-    );
-    res.json({ success: true, message: "Post approved successfully" });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 3. Admin Reject Endpoint (Deletes the post document)
-app.delete("/api/admin/posts/:id/reject", async (req, res) => {
-  try {
-    const { id } = req.params;
-    await forumCollection.deleteOne({ _id: new ObjectId(id) });
-    res.json({ success: true, message: "Post rejected and removed" });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-app.get('/api/admin/transactions', async (req, res) => {
-  try {
-    const transactions = await bookingsCollection
-          .aggregate([
-        { $sort: { bookedAt: 1 } },
-        { $limit: 5 },
-        {
-          $addFields: {
-            userObjectId: { $toObjectId: "$userId" } 
-          }
-        },
-        {
-          $lookup: {
-            from: "user", // Name of your users collection in MongoDB
-            localField: "userObjectId",
-            foreignField: "_id",
-            as: "userInfo"
-          }
-        },
-        {
-          $unwind: {
-            path: "$userInfo",
-            preserveNullAndEmptyArrays: true
-          }
-        },
-        {
-          $project: {
-            _id: 1,
-            price: 1,
-            amount: 1,
-            bookedAt: 1,
-            createdAt: 1,
-            // Extract email from joined user document, or fall back to embedded object
-            email: { $ifNull: ["$userInfo.email", "$user.email", "N/A"] }
-          }
-        }
-      ])
-      .toArray();
-
-    res.json(transactions);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-
-// POST: Submit a new trainer application
-app.post('/api/trainer-applications', async (req, res) => {
-  try {
-    const { userId, email, fullName, experience, specialty, availableTimes, coachingPhilosophy } = req.body;
-
-    // Check if user already has a pending application
-    const existingApp = await trainerApplicationsCollection.findOne({
-      $or: [{ userId }, { email }],
-      status: 'pending',
-    });
-
-    if (existingApp) {
-      return res.status(400).json({
-        success: false,
-        message: 'You already have a pending trainer application under review.',
-      });
-    }
-
-    const newApplication = {
-      userId,
-      fullName,
-      email,
-      experience: Number(experience),
-      specialty,
-      availableTimes,
-      coachingPhilosophy,
-      status: 'pending',
-      appliedAt: new Date(),
-    };
-
-    const result = await trainerApplicationsCollection.insertOne(newApplication);
-    res.status(201).json({ success: true, insertedId: result.insertedId });
-  } catch (error) {
-    console.error('Error submitting trainer application:', error);
-    res.status(500).json({ success: false, message: 'Failed to process application' });
-  }
-});
-
-// 1. GET: Fetch all trainer applications with user data joined
-app.get('/api/admin/applied-trainers', async (req, res) => {
-  try {
-    const applications = await trainerApplicationsCollection
-      .aggregate([
-        {
-          $addFields: {
-            userObjectId: {
-              $convert: {
-                input: '$userId',
-                to: 'objectId',
-                onError: '$userId',
-                onNull: '$userId',
+    app.get(
+      "/api/admin/trainers",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const trainers = await userCollection
+            .aggregate([
+              { $match: { role: { $in: ["trainer", "member"] } } },
+              {
+                $lookup: {
+                  from: "class",
+                  localField: "email",
+                  foreignField: "trainerEmail",
+                  as: "trainerClasses",
+                },
               },
-            },
-          },
-        },
-        {
-          $lookup: {
-            from: 'users', // Check your MongoDB collection name ('users' or 'user')
-            localField: 'userObjectId',
-            foreignField: '_id',
-            as: 'userInfo',
-          },
-        },
-        {
-          $unwind: {
-            path: '$userInfo',
-            preserveNullAndEmptyArrays: true,
-          },
-        },
-        {
-          $addFields: {
-            userName: { $ifNull: ['$userInfo.name', '$fullName', '$email'] },
-            userEmail: { $ifNull: ['$userInfo.email', '$email'] },
-          },
-        },
-        {
-          $project: { userInfo: 0, userObjectId: 0 },
-        },
-        {
-          $sort: { appliedAt: -1 },
-        },
-      ])
-      .toArray();
+              {
+                $addFields: {
+                  classIdsAsStrings: {
+                    $map: {
+                      input: "$trainerClasses",
+                      as: "c",
+                      in: { $toString: "$$c._id" },
+                    },
+                  },
+                },
+              },
+              {
+                $lookup: {
+                  from: "bookings",
+                  localField: "classIdsAsStrings",
+                  foreignField: "classId",
+                  as: "classBookings",
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  name: 1,
+                  email: 1,
+                  image: 1,
+                  role: 1,
+                  classesCount: { $size: "$trainerClasses" },
+                  studentsCount: { $size: "$classBookings" },
+                },
+              },
+            ])
+            .toArray();
 
-    res.json(applications);
-  } catch (error) {
-    console.error('Error fetching applications:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 2. PATCH: Update Status (Approve/Reject) + Reason + Role Promotion
-app.patch('/api/admin/applied-trainers/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status, rejectionReason } = req.body;
-
-    // Build base update payload
-    const updateDoc = {
-      $set: {
-        status,
-        reviewedAt: new Date(),
+          res.json(trainers);
+        } catch (err) {
+          res.status(500).json({ error: "Failed to fetch trainers" });
+        }
       },
-    };
-
-    if (status === 'rejected' && rejectionReason) {
-      updateDoc.$set.rejectionReason = rejectionReason;
-    } else if (status === 'approved') {
-      updateDoc.$unset = { rejectionReason: '' };
-    }
-
-    // 1. Fetch current application
-    const application = await trainerApplicationsCollection.findOne({
-      _id: new ObjectId(id),
-    });
-
-    if (!application) {
-      return res.status(404).json({ success: false, message: 'Application not found' });
-    }
-
-    // 2. Update application document
-    await trainerApplicationsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      updateDoc
     );
 
-    // 3. If approved, promote user role in `users` collection
-    if (status === 'approved') {
-      const userFilter = ObjectId.isValid(application.userId)
-        ? { _id: new ObjectId(application.userId) }
-        : { _id: application.userId };
+    app.patch("/api/admin/trainers/:id/role", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { role } = req.body;
 
-      await userCollection.updateOne(userFilter, {
-        $set: {
-          role: 'trainer',
-          specialty: application.specialty,
-          experience: application.experience,
-        },
-      });
-    }
+        await userCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role: role } },
+        );
 
-    res.json({ success: true, message: `Application mark as ${status}` });
-  } catch (error) {
-    console.error('Error updating status:', error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-const buildUserQuery = (userId, email) => {
-  const conditions = [];
-  if (userId) {
-    conditions.push({ userId: userId });
-    if (ObjectId.isValid(userId)) {
-      conditions.push({ userId: new ObjectId(userId) });
-    }
-  }
-  if (email) conditions.push({ email: email });
-  return conditions.length > 0 ? { $or: conditions } : {};
-};
-
-// GET: Dashboard Stats & Trainer Application Status for Member
-app.get('/api/member/stats', async (req, res) => {
-  try {
-    const { userId, email } = req.query;
-
-    const userQuery = buildUserQuery(userId, email);
-
-    // 1. Fetch latest application
-    const application = await trainerApplicationsCollection
-      .find(userQuery)
-      .sort({ appliedAt: -1 })
-      .limit(1)
-      .toArray();
-
-    // 2. Count Booked Classes & Favorites
-    const bookedCount = await bookingsCollection.countDocuments(userQuery);
-    const favoritesCount = await favoritesCollection.countDocuments(userQuery);
-
-    res.json({
-      success: true,
-      bookedCount,
-      favoritesCount,
-      application: application[0] || null,
+        res.json({ message: `Role updated to ${role}` });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to update role" });
+      }
     });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
 
-// GET: Booked Classes for Member
-app.get('/api/member/booked-classes', async (req, res) => {
-  try {
-    const { userId, email } = req.query;
-    const userQuery = buildUserQuery(userId, email);
+    app.get(
+      "/api/admin/classes",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const classes = await classCollection
+            .aggregate([
+              {
+                $addFields: {
+                  trainerObjectId: { $toObjectId: "$trainerId" },
+                },
+              },
+              {
+                $lookup: {
+                  from: "user",
+                  localField: "trainerObjectId",
+                  foreignField: "_id",
+                  as: "trainerInfo",
+                },
+              },
+              {
+                $unwind: {
+                  path: "$trainerInfo",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+              {
+                $addFields: {
+                  trainerName: {
+                    $ifNull: ["$trainerInfo.name", "Master Trainer"],
+                  },
+                  trainerEmail: {
+                    $ifNull: ["$trainerInfo.email", "N/A"],
+                  },
+                },
+              },
+              {
+                $project: {
+                  trainerInfo: 0,
+                  trainerObjectId: 0,
+                },
+              },
+              { $sort: { _id: -1 } },
+            ])
+            .toArray();
 
-    const bookings = await bookingsCollection.find(userQuery).sort({ bookedAt: -1 }).toArray();
-    res.json(bookings);
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
+          res.status(200).json(classes);
+        } catch (err) {
+          console.error("Error fetching admin classes:", err);
+          res.status(500).json({ error: "Failed to fetch classes for admin" });
+        }
+      },
+    );
 
-// GET: Favorite Classes for Member
-app.get('/api/member/favorite-classes', async (req, res) => {
-  try {
-    const { userId, email } = req.query;
-    const userQuery = buildUserQuery(userId, email);
+    app.patch("/api/admin/classes/:id/approve", async (req, res) => {
+      try {
+        const { id } = req.params;
+        await classCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: "approved" } },
+        );
+        res.json({ success: true, message: "Class approved successfully" });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to approve class" });
+      }
+    });
 
-    const favorites = await favoritesCollection.find(userQuery).sort({ savedAt: -1 }).toArray();
-    res.json(favorites);
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
+    app.delete("/api/admin/classes/:id/reject", async (req, res) => {
+      try {
+        const { id } = req.params;
+        await classCollection.deleteOne({ _id: new ObjectId(id) });
+        res.json({ success: true, message: "Class rejected and deleted" });
+      } catch (err) {
+        res.status(500).json({ error: "Failed to reject class" });
+      }
+    });
 
+    app.get(
+      "/api/admin/posts",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const posts = await forumCollection
+            .aggregate([
+              {
+                $addFields: {
+                  trainerObjectId: { $toObjectId: "$trainerId" },
+                },
+              },
+              {
+                $lookup: {
+                  from: "user",
+                  localField: "trainerObjectId",
+                  foreignField: "_id",
+                  as: "trainerInfo",
+                },
+              },
+              {
+                $unwind: {
+                  path: "$trainerInfo",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+              {
+                $addFields: {
+                  trainerName: {
+                    $ifNull: ["$trainerInfo.name", "Master Trainer"],
+                  },
+                  trainerEmail: {
+                    $ifNull: ["$trainerInfo.email", "N/A"],
+                  },
+                },
+              },
+              {
+                $project: {
+                  trainerInfo: 0,
+                  trainerObjectId: 0,
+                },
+              },
+              { $sort: { _id: -1 } },
+            ])
+            .toArray();
 
+          res.status(200).json(posts);
+        } catch (error) {
+          res
+            .status(500)
+            .json({ success: false, message: "Failed to fetch posts" });
+        }
+      },
+    );
 
+    app.patch("/api/admin/posts/:id/approve", async (req, res) => {
+      try {
+        const { id } = req.params;
+        await forumCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status: "approved" } },
+        );
+        res.json({ success: true, message: "Post approved successfully" });
+      } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
 
+    app.delete("/api/admin/posts/:id/reject", async (req, res) => {
+      try {
+        const { id } = req.params;
+        await forumCollection.deleteOne({ _id: new ObjectId(id) });
+        res.json({ success: true, message: "Post rejected and removed" });
+      } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
+    app.get(
+      "/api/admin/transactions",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const transactions = await bookingsCollection
+            .aggregate([
+              { $sort: { bookedAt: 1 } },
+              { $limit: 5 },
+              {
+                $addFields: {
+                  userObjectId: { $toObjectId: "$userId" },
+                },
+              },
+              {
+                $lookup: {
+                  from: "user",
+                  localField: "userObjectId",
+                  foreignField: "_id",
+                  as: "userInfo",
+                },
+              },
+              {
+                $unwind: {
+                  path: "$userInfo",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  price: 1,
+                  amount: 1,
+                  bookedAt: 1,
+                  createdAt: 1,
 
+                  email: { $ifNull: ["$userInfo.email", "$user.email", "N/A"] },
+                },
+              },
+            ])
+            .toArray();
 
+          res.json(transactions);
+        } catch (error) {
+          res.status(500).json({ message: error.message });
+        }
+      },
+    );
 
-    await client.db("admin").command({ ping: 1 });
+    app.post("/api/trainer-applications", async (req, res) => {
+      try {
+        const {
+          userId,
+          email,
+          fullName,
+          experience,
+          specialty,
+          availableTimes,
+          coachingPhilosophy,
+        } = req.body;
+
+        const existingApp = await trainerApplicationsCollection.findOne({
+          $or: [{ userId }, { email }],
+          status: "pending",
+        });
+
+        if (existingApp) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "You already have a pending trainer application under review.",
+          });
+        }
+
+        const newApplication = {
+          userId,
+          fullName,
+          email,
+          experience: Number(experience),
+          specialty,
+          availableTimes,
+          coachingPhilosophy,
+          status: "pending",
+          appliedAt: new Date(),
+        };
+
+        const result =
+          await trainerApplicationsCollection.insertOne(newApplication);
+        res.status(201).json({ success: true, insertedId: result.insertedId });
+      } catch (error) {
+        console.error("Error submitting trainer application:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to process application" });
+      }
+    });
+
+    app.get(
+      "/api/admin/applied-trainers",
+      verifyToken,
+      requireRole("admin"),
+      async (req, res) => {
+        try {
+          const applications = await trainerApplicationsCollection
+            .aggregate([
+              {
+                $addFields: {
+                  userObjectId: {
+                    $convert: {
+                      input: "$userId",
+                      to: "objectId",
+                      onError: "$userId",
+                      onNull: "$userId",
+                    },
+                  },
+                },
+              },
+              {
+                $lookup: {
+                  from: "users",
+                  localField: "userObjectId",
+                  foreignField: "_id",
+                  as: "userInfo",
+                },
+              },
+              {
+                $unwind: {
+                  path: "$userInfo",
+                  preserveNullAndEmptyArrays: true,
+                },
+              },
+              {
+                $addFields: {
+                  userName: {
+                    $ifNull: ["$userInfo.name", "$fullName", "$email"],
+                  },
+                  userEmail: { $ifNull: ["$userInfo.email", "$email"] },
+                },
+              },
+              {
+                $project: { userInfo: 0, userObjectId: 0 },
+              },
+              {
+                $sort: { appliedAt: -1 },
+              },
+            ])
+            .toArray();
+
+          res.json(applications);
+        } catch (error) {
+          console.error("Error fetching applications:", error);
+          res.status(500).json({ success: false, message: error.message });
+        }
+      },
+    );
+
+    app.patch("/api/admin/applied-trainers/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status, rejectionReason } = req.body;
+
+        const updateDoc = {
+          $set: {
+            status,
+            reviewedAt: new Date(),
+          },
+        };
+
+        if (status === "rejected" && rejectionReason) {
+          updateDoc.$set.rejectionReason = rejectionReason;
+        } else if (status === "approved") {
+          updateDoc.$unset = { rejectionReason: "" };
+        }
+
+        const application = await trainerApplicationsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!application) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Application not found" });
+        }
+
+        await trainerApplicationsCollection.updateOne(
+          { _id: new ObjectId(id) },
+          updateDoc,
+        );
+
+        if (status === "approved") {
+          const userFilter = ObjectId.isValid(application.userId)
+            ? { _id: new ObjectId(application.userId) }
+            : { _id: application.userId };
+
+          await userCollection.updateOne(userFilter, {
+            $set: {
+              role: "trainer",
+              specialty: application.specialty,
+              experience: application.experience,
+            },
+          });
+        }
+
+        res.json({ success: true, message: `Application mark as ${status}` });
+      } catch (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
+    const buildUserQuery = (userId, email) => {
+      const conditions = [];
+      if (userId) {
+        conditions.push({ userId: userId });
+        if (ObjectId.isValid(userId)) {
+          conditions.push({ userId: new ObjectId(userId) });
+        }
+      }
+      if (email) conditions.push({ email: email });
+      return conditions.length > 0 ? { $or: conditions } : {};
+    };
+
+    app.get("/api/member/stats", async (req, res) => {
+      try {
+        const { userId, email } = req.query;
+
+        const userQuery = buildUserQuery(userId, email);
+
+        // 1. Fetch latest application
+        const application = await trainerApplicationsCollection
+          .find(userQuery)
+          .sort({ appliedAt: -1 })
+          .limit(1)
+          .toArray();
+
+        const bookedCount = await bookingsCollection.countDocuments(userQuery);
+        const favoritesCount =
+          await favoritesCollection.countDocuments(userQuery);
+
+        res.json({
+          success: true,
+          bookedCount,
+          favoritesCount,
+          application: application[0] || null,
+        });
+      } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
+    app.get("/api/member/booked-classes", async (req, res) => {
+      try {
+        const { userId, email } = req.query;
+        const userQuery = buildUserQuery(userId, email);
+
+        const bookings = await bookingsCollection
+          .find(userQuery)
+          .sort({ bookedAt: -1 })
+          .toArray();
+        res.json(bookings);
+      } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
+
+    app.get("/api/member/favorite-classes", async (req, res) => {
+      try {
+        const { userId, email } = req.query;
+        const userQuery = buildUserQuery(userId, email);
+
+        const favorites = await favoritesCollection
+          .find(userQuery)
+          .sort({ savedAt: -1 })
+          .toArray();
+        res.json(favorites);
+      } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+      }
+    });
+    app.get(
+      "/api/trainer/stats",
+      verifyToken,
+      requireRole("trainer"),
+      async (req, res) => {
+        try {
+          const { email } = req.query;
+
+          if (!email) {
+            return res
+              .status(400)
+              .json({ success: false, message: "Email is required" });
+          }
+
+          const classesCreated = await classCollection.countDocuments({
+            $or: [
+              { trainerEmail: email },
+              { "trainer.email": email },
+              { userEmail: email },
+              { email: email },
+            ],
+          });
+
+          const forumPosts = await forumCollection.countDocuments({
+            $or: [
+              { userEmail: email },
+              { trainerEmail: email },
+              { email: email },
+              { "author.email": email },
+              { "user.email": email },
+            ],
+          });
+
+          res.json({
+            success: true,
+            stats: {
+              classesCreated,
+              forumPosts,
+            },
+          });
+        } catch (error) {
+          console.error("Error fetching trainer stats:", error);
+          res.status(500).json({ success: false, message: error.message });
+        }
+      },
+    );
+
+    // await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!",
     );
